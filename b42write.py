@@ -44,7 +44,13 @@ def cell_chunkdata(m, key):
     as zombie.pot.POT.convertChunkData does (getOldChunkDataBits by absolute square)."""
     ox, oy = key[0] * CELL, key[1] * CELL
     out = np.zeros((CELL, CELL), dtype=np.uint8)
-    for (sx, sy), arr in m.chunkdata.items():
+    cd = m.chunkdata
+    if hasattr(cd, "paths"):  # a lazy map: read only the source cells this output cell overlaps
+        src = [(k, cd.get(k)) for k in ((sx, sy) for sx in range(ox // m.cell, (ox + CELL - 1) // m.cell + 1)
+                                        for sy in range(oy // m.cell, (oy + CELL - 1) // m.cell + 1)) if k in cd.paths]
+    else:
+        src = cd.items()
+    for (sx, sy), arr in src:
         x0, y0 = sx * m.cell, sy * m.cell
         ax0, ay0 = max(ox, x0), max(oy, y0)
         ax1, ay1 = min(ox + CELL, x0 + m.cell), min(oy + CELL, y0 + m.cell)
@@ -74,9 +80,13 @@ def write_cell(folder, key, m, cell, names_of_gid, zpop):
     cx, cy = key
     ox, oy = cx * CELL, cy * CELL
     idx = cell["idx"]
-    lx = (m.x[idx] - ox).astype(np.int64)
-    ly = (m.y[idx] - oy).astype(np.int64)
-    lz = m.z[idx].astype(np.int64)
+    src = m
+    if idx is None:  # a lazy map (regrid.Map(lazy=True)): this output cell's squares are read now, nothing else is held
+        src = m.view(key)
+        idx = np.arange(len(src.x))
+    lx = (src.x[idx] - ox).astype(np.int64)
+    ly = (src.y[idx] - oy).astype(np.int64)
+    lz = src.z[idx].astype(np.int64)
     # rooms of the buildings this cell owns, renumbered; old room index -> new
     rooms_new, room_map, blds = [], {}, []
     for bi in cell["buildings"]:
@@ -93,9 +103,9 @@ def write_cell(folder, key, m, cell, names_of_gid, zpop):
     keep = np.zeros(len(idx), bool)
     dropped = 0
     for k, i in enumerate(idx.tolist()):
-        s = m.start[i]
+        s = src.start[i]
         st = []
-        for g in m.tiles[s:s + m.count[i]].tolist():
+        for g in src.tiles[s:s + src.count[i]].tolist():
             n = names_of_gid[g]
             if n is None:
                 dropped += 1
@@ -136,7 +146,7 @@ def write_cell(folder, key, m, cell, names_of_gid, zpop):
     per = (maxl - minl + 1) * CHUNK * CHUNK
     pos_in = (lz - minl) * CHUNK * CHUNK + (lx % CHUNK) * CHUNK + (ly % CHUNK)
     order.sort(key=lambda k: (int(ci[k]), int(pos_in[k])))
-    room_of = m.room[idx]
+    room_of = src.room[idx]
     head = b"LOTP" + struct.pack("<ii", 1, CHUNKS * CHUNKS)
     table_at = len(head)
     body = bytearray(head + b"\x00" * (8 * CHUNKS * CHUNKS))
@@ -174,17 +184,22 @@ def roundtrip(m, cells, table, folder):
     stacks_equal, rooms_equal, buildings_equal, zpop_equal, trailing_bytes, first_diff)"""
     import b41
     names = map_tiles(m, table)
-    exp = {}
-    for i in range(len(m.x)):
-        s = m.start[i]
-        st = tuple(n for n in (names[g] for g in m.tiles[s:s + m.count[i]].tolist()) if n is not None)
-        if st:
-            exp[(int(m.x[i]), int(m.y[i]), int(m.z[i]))] = st
-    got = {}
-    rooms_ok = blds_ok = zpop_ok = chunk_ok = True
+    rooms_ok = blds_ok = zpop_ok = chunk_ok = sq_equal = stacks_equal = True
+    n_exp = n_got = 0
     trailing = 0
     first = None
-    for key in sorted(cells):
+    for key in sorted(cells):  # one output cell at a time: what should be in it, then what is in its files
+        src, idx = m, cells[key]["idx"]
+        if idx is None:  # a lazy map
+            src = m.view(key)
+            idx = np.arange(len(src.x))
+        exp = {}
+        for i in idx.tolist():
+            s = src.start[i]
+            st = tuple(n for n in (names[g] for g in src.tiles[s:s + src.count[i]].tolist()) if n is not None)
+            if st:
+                exp[(int(src.x[i]), int(src.y[i]), int(src.z[i]))] = st
+        got = {}
         hp = os.path.join(folder, "%d_%d.lotheader" % key)
         h = b41.read_header(hp)
         trailing += h["trailing"]
@@ -215,13 +230,16 @@ def roundtrip(m, cells, table, folder):
             if not (os.path.exists(cd) and np.array_equal(b41.read_chunkdata(cd, 1), cell_chunkdata(m, key))):
                 chunk_ok = False
                 first = first or ("chunkdata", key)
-    sq_equal = set(exp) == set(got)
-    stacks_equal = sq_equal and all(exp[k] == got[k] for k in exp)
-    if not stacks_equal and first is None:
-        diff = sorted(set(exp) ^ set(got))[:1] or [k for k in exp if exp[k] != got.get(k)][:1]
-        first = ("squares", diff)
+        n_exp += len(exp)
+        n_got += len(got)
+        same = set(exp) == set(got)
+        sq_equal = sq_equal and same
+        same_stacks = same and all(exp[k] == got[k] for k in exp)
+        stacks_equal = stacks_equal and same_stacks
+        if not same_stacks and first is None:
+            first = ("squares", sorted(set(exp) ^ set(got))[:1] or [k for k in exp if exp[k] != got.get(k)][:1])
     ok = sq_equal and stacks_equal and rooms_ok and blds_ok and zpop_ok and chunk_ok and trailing == 0
-    return dict(ok=ok, squares_expected=len(exp), squares_read=len(got), squares_equal=sq_equal,
+    return dict(ok=ok, squares_expected=n_exp, squares_read=n_got, squares_equal=sq_equal,
                 stacks_equal=stacks_equal, rooms_equal=rooms_ok, buildings_equal=blds_ok, zpop_equal=zpop_ok,
                 chunkdata_equal=chunk_ok if m.chunkdata else None,
                 trailing_bytes=trailing, first_diff=repr(first) if first else None)

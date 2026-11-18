@@ -5,6 +5,7 @@ World SQUARE coordinates are kept between builds (research b672d60): a B41 squar
 B42 square (x, y, z); only the cell (300 -> 256) and chunk (10 -> 8) grids change. Read-only on its inputs.
 """
 import collections
+import itertools
 import os
 import time
 
@@ -23,18 +24,60 @@ K = 1 << 16  # key packing: x, y < 65536; z in -32..32
 B41_ZOMBIE_INTENSITY_DIVISOR = 51
 
 
-class Map:
-    """All squares of one map folder in absolute coordinates, tile names in one map-wide vocabulary."""
+class _View:
+    """The squares of one output cell: parallel arrays x, y, z, room, start, count and the tile ids they point into."""
 
-    def __init__(self, folder, run=None, name=None, want_tiles=True):
+
+class _Lru:
+    """The few B41 cells (or chunkdata arrays) an output cell reads, kept while its neighbours need them: `capacity` entries."""
+
+    def __init__(self, capacity):
+        self.capacity, self.d, self.loads = capacity, collections.OrderedDict(), 0
+
+    def get(self, key, load):
+        if key in self.d:
+            self.d.move_to_end(key)
+            return self.d[key]
+        v = self.d[key] = load()
+        self.loads += 1
+        while len(self.d) > self.capacity:
+            self.d.popitem(last=False)
+        return v
+
+
+class _Chunkdata:
+    """chunkdata_X_Y.bin of a lazy Map: the paths are kept, an array is read when an output cell needs it (b42write.cell_chunkdata)."""
+
+    def __init__(self, paths, version, capacity):
+        self.paths, self.version, self.cache = paths, version, _Lru(capacity)
+
+    def __len__(self):
+        return len(self.paths)
+
+    def get(self, key):
+        return self.cache.get(key, lambda: b41.read_chunkdata(self.paths[key], self.version))
+
+
+class Map:
+    """All squares of one map folder in absolute coordinates, tile names in one map-wide vocabulary.
+
+    lazy=True (the converter's way, tools/pz/convert/cli.py): the squares of the B41 cells are NOT concatenated. Only headers, rooms,
+    buildings and zombie density are kept (they are small), and a B41 cell's squares are read when an output cell needs them
+    (view). Memory then follows one output cell plus a small cache of source cells, not the map (Project Russia, 3,600 cells,
+    died allocating 1.22 GiB for one of the whole-map arrays). The calibration tools keep the default: they compare whole maps."""
+
+    def __init__(self, folder, run=None, name=None, want_tiles=True, lazy=False):
         self.folder, self.name = folder, name or folder
+        self.lazy = lazy
         self.cells = {}
+        self._src = {}  # lazy: (cx, cy) -> what read_pack and the remap need
         self.vocab, self.gid = [], {}
         xs, ys, zs, rooms, starts, counts, tiles = [], [], [], [], [], [], []
         self.rooms, self.buildings = [], []  # rooms: dict(name, level, rects abs, cell, objects); buildings: [room idx]
         self.zpop = {}  # (cx, cy) -> array
         self.chunkdata = {}  # (cx, cy) -> uint8 [x][y] collision bits of the cell (chunkdata_X_Y.bin), when present
         ntiles = 0
+        cd_paths = {}
         for (cx, cy), (hp, pp) in sorted(b41.map_cells(folder).items()):
             t0 = time.time()
             h = b41.read_header(hp)
@@ -50,9 +93,16 @@ class Map:
             self.zpop[(cx, cy)] = h["zpop"]
             cd = os.path.join(folder, "chunkdata_%d_%d.bin" % (cx, cy))
             if os.path.exists(cd):
-                self.chunkdata[(cx, cy)] = b41.read_chunkdata(cd, h["version"])
+                if lazy:
+                    cd_paths[(cx, cy)] = cd
+                else:
+                    self.chunkdata[(cx, cy)] = b41.read_chunkdata(cd, h["version"])
             n = 0
-            if pp:
+            if pp and lazy:
+                n = None  # counted when the cell is first read (squares_total)
+                self._src[(cx, cy)] = dict(pp=pp, remap=remap, room_base=room_base,
+                                           header={k: h[k] for k in ("version", "chunks", "chunk", "minlevel", "maxlevel")})
+            elif pp:
                 p = b41.read_pack(pp, h, want_tiles)
                 n = len(p["x"])
                 xs.append(p["x"] + cx * self.cell); ys.append(p["y"] + cy * self.cell); zs.append(p["z"])
@@ -68,9 +118,64 @@ class Map:
                 run.log(self.name, "read", cell=(cx, cy), grid="b41" if self.version == 0 else "b42",
                         ms=(time.time() - t0) * 1000, squares=n, levels=[h["minlevel"], h["maxlevel"] - 1],
                         buildings_in=len(h["buildings"]), rooms_in=len(h["rooms"]))
+        if lazy:
+            # one B41 column of cells is read by the output cells of two neighbouring columns: two B41 rows of cells stay cached
+            ys_ = [k[1] for k in self._src] or [0]
+            cap = 2 * (max(ys_) - min(ys_) + 1) + 4
+            self._cache = _Lru(cap)
+            self.chunkdata = _Chunkdata(cd_paths, getattr(self, "version", 0), cap) if cd_paths else {}
+            return
         cat = lambda v: np.concatenate(v) if v else np.zeros(0, np.int32)
         self.x, self.y, self.z = cat(xs), cat(ys), cat(zs)
         self.room, self.start, self.count, self.tiles = cat(rooms), cat(starts), cat(counts), cat(tiles)
+
+    def squares_total(self):
+        """Squares holding tiles in the whole map (lazy: those of the cells read so far; after write_map, all of them)."""
+        if not self.lazy:
+            return int(len(self.x))
+        return sum(c["squares"] or 0 for c in self.cells.values())
+
+    def source(self, key):
+        """lazy: one B41 cell's squares in absolute coordinates, room indexes and tile ids already the map's own."""
+        def load():
+            s = self._src[key]
+            p = b41.read_pack(s["pp"], s["header"])
+            rr = p["room"].copy()
+            rr[rr >= 0] += s["room_base"]
+            self.cells[key]["squares"] = len(p["x"])
+            return dict(x=p["x"] + key[0] * self.cell, y=p["y"] + key[1] * self.cell, z=p["z"], room=rr, start=p["start"],
+                        count=p["count"], tiles=s["remap"][p["tiles"]] if len(p["tiles"]) else p["tiles"])
+        return self._cache.get(key, load)
+
+    def view(self, key, cell=256):
+        """lazy: the squares of output cell `key` as an object with x, y, z, room, start, count, tiles (the map's arrays, restricted),
+        in the order the eager map lists them: source cells by (cx, cy), each in file order."""
+        ox, oy = key[0] * cell, key[1] * cell
+        parts = []
+        for sx in range(ox // self.cell, (ox + cell - 1) // self.cell + 1):
+            for sy in range(oy // self.cell, (oy + cell - 1) // self.cell + 1):
+                if (sx, sy) in self._src:
+                    s = self.source((sx, sy))
+                    sel = (s["x"] >= ox) & (s["x"] < ox + cell) & (s["y"] >= oy) & (s["y"] < oy + cell)
+                    if sel.any():
+                        parts.append((s, sel))
+        v = _View()
+        names = ("x", "y", "z", "room")
+        for n in names:
+            setattr(v, n, np.concatenate([s[n][sel] for s, sel in parts]) if parts else np.zeros(0, np.int32))
+        starts, counts, tiles, base = [], [], [], 0
+        for s, sel in parts:
+            cnt, st = s["count"][sel].astype(np.int64), s["start"][sel].astype(np.int64)
+            new = np.cumsum(cnt) - cnt
+            total = int(cnt.sum())
+            tiles.append(s["tiles"][np.repeat(st - new, cnt) + np.arange(total)] if total else np.zeros(0, np.int32))
+            starts.append((new + base).astype(np.int32))
+            counts.append(cnt.astype(np.int32))
+            base += total
+        v.start = np.concatenate(starts) if starts else np.zeros(0, np.int32)
+        v.count = np.concatenate(counts) if counts else np.zeros(0, np.int32)
+        v.tiles = np.concatenate(tiles) if tiles else np.zeros(0, np.int32)
+        return v
 
     def _gid(self, name):
         g = self.gid.get(name)
@@ -114,22 +219,24 @@ def regrid(m, run=None, cell=256, chunk=8):
     zpop 32x32)}. Buildings go to the cell holding their bbox min corner (rooms keep absolute rects;
     rooms whose rects cross that cell's edge are counted as rooms_split for the WS2 writer)."""
     t0 = time.time()
-    cx, cy = m.x // cell, m.y // cell
     out = {}
-    order = np.lexsort((cy, cx))
-    if len(order):
-        ck = (cx[order].astype(np.int64) << 32) | (cy[order].astype(np.int64) & 0xFFFFFFFF)
-        cuts = np.flatnonzero(np.diff(ck)) + 1
-        for part in np.split(order, cuts):
-            key = (int(cx[part[0]]), int(cy[part[0]]))
-            out[key] = dict(idx=part, buildings=[], rooms=set(), rooms_split=0)
+    empty = lambda: dict(idx=None if m.lazy else np.zeros(0, np.int64), buildings=[], rooms=set(), rooms_split=0)  # lazy: idx None = m.view(key)
+    if not m.lazy:  # the cells that hold squares; a lazy map has no square list, and every such cell is also one a source cell overlaps (below)
+        cx, cy = m.x // cell, m.y // cell
+        order = np.lexsort((cy, cx))
+        if len(order):
+            ck = (cx[order].astype(np.int64) << 32) | (cy[order].astype(np.int64) & 0xFFFFFFFF)
+            cuts = np.flatnonzero(np.diff(ck)) + 1
+            for part in np.split(order, cuts):
+                key = (int(cx[part[0]]), int(cy[part[0]]))
+                out[key] = dict(idx=part, buildings=[], rooms=set(), rooms_split=0)
     for bi, b in enumerate(m.buildings):
         rects = [rc for i in b for rc in m.rooms[i]["rects"]]
         if not rects:
             continue
         x0, y0 = min(r[0] for r in rects), min(r[1] for r in rects)
         key = (x0 // cell, y0 // cell)
-        c = out.setdefault(key, dict(idx=np.zeros(0, np.int64), buildings=[], rooms=set(), rooms_split=0))
+        c = out.setdefault(key, empty())
         c["buildings"].append(bi)
         ox, oy = key[0] * cell, key[1] * cell
         for i in b:
@@ -143,7 +250,7 @@ def regrid(m, run=None, cell=256, chunk=8):
         x0, y0 = sx * m.cell, sy * m.cell
         for ncx in range(x0 // cell, (x0 + m.cell - 1) // cell + 1):
             for ncy in range(y0 // cell, (y0 + m.cell - 1) // cell + 1):
-                out.setdefault((ncx, ncy), dict(idx=np.zeros(0, np.int64), buildings=[], rooms=set(), rooms_split=0))
+                out.setdefault((ncx, ncy), empty())
     # zombie density: B41 grid entry = one 10x10 chunk; B42 entry = one 8x8 chunk; area-weighted mean on the
     # 2-square common grid (gcd(10, 8) = 2), absent source coverage counts as 0
     src_cell, src_chunk = m.cell, m.chunk
@@ -155,7 +262,11 @@ def regrid(m, run=None, cell=256, chunk=8):
         gx, gy = np.meshgrid(sx, sy, indexing="ij")
         scx, scy = gx // src_cell, gy // src_cell
         val = np.zeros(gx.shape)
-        for (a, b2), zp in m.zpop.items():
+        # only the source cells this output cell overlaps (was: every cell of the map, 3,600 x 3,600 numpy masks on Project Russia)
+        for a, b2 in itertools.product(range(int(scx.min()), int(scx.max()) + 1), range(int(scy.min()), int(scy.max()) + 1)):
+            zp = m.zpop.get((a, b2))
+            if zp is None:
+                continue
             sel = (scx == a) & (scy == b2)
             if sel.any():
                 lx = (gx[sel] - a * src_cell) // src_chunk
@@ -167,10 +278,10 @@ def regrid(m, run=None, cell=256, chunk=8):
             z = np.where((z > 0) & (q == 0), 1, q)
         c["zpop"] = np.rint(z).astype(np.uint8)
         if run:
-            lv = m.z[c["idx"]]
+            lv = None if m.lazy else m.z[c["idx"]]  # lazy: the squares are read when the cell is written (its "write" line has them)
             run.log(m.name, "regrid", cell=key, grid="b42", ms=(time.time() - t0) * 1000,
-                    squares=int(len(c["idx"])),
-                    levels=[int(lv.min()), int(lv.max())] if len(lv) else None,
+                    squares=None if m.lazy else int(len(c["idx"])),
+                    levels=[int(lv.min()), int(lv.max())] if lv is not None and len(lv) else None,
                     buildings_out=len(c["buildings"]), rooms_out=len(c["rooms"]), rooms_split=c["rooms_split"])
             t0 = time.time()
     return out

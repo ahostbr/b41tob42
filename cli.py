@@ -51,7 +51,7 @@ def convert(src, out, game, mod_roots=None, table_tsv=None, name=None):
     known = tiles.known_b42(game=game, map_tiles=dep_tiles)
     table = tiles.Table(known, tiles.load_tsv(table_tsv) if table_tsv else None)
     run.map(name, source=src, dependencies=notes, known_tiles=len(known))
-    m = regrid.Map(src, run, name)
+    m = regrid.Map(src, run, name, lazy=True)  # one output cell at a time: a 3,600-cell map does not fit in memory as one set of arrays
     cells = regrid.regrid(m, run)
     b42write.write_map(m, cells, table, dest, run)
     for f in COPIED:
@@ -66,7 +66,7 @@ def convert(src, out, game, mod_roots=None, table_tsv=None, name=None):
         counts[how.split(":")[0]] = counts.get(how.split(":")[0], 0) + 1
     unmapped = [(n, table.suggest(n)) for n, b in zip(m.vocab, names) if table.resolve(n)[0] is None and table.resolve(n)[1] != "author_dropped"]
     rec = run.receipt()
-    rec["summary"] = dict(source=src, output=dest, b41_cells=len(m.cells), b42_cells=len(cells), squares=int(len(m.x)),
+    rec["summary"] = dict(source=src, output=dest, b41_cells=len(m.cells), b42_cells=len(cells), squares=m.squares_total(),
                           buildings=len(m.buildings), rooms=len(m.rooms), tile_names=counts, chunkdata=bool(m.chunkdata),
                           dependencies=notes, roundtrip_ok=rt["ok"], seconds=round(time.time() - t0, 1))
     with open(os.path.join(out, name + ".receipt.json"), "w", encoding="utf-8") as f:
